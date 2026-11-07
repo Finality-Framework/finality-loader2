@@ -1,0 +1,3 @@
+rootProject.name = 'finality-loader'
+include ':lumipatch-desktop'
+
