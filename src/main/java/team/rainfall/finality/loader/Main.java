@@ -37,6 +37,7 @@ public final class Main {
     private static final String LOADER_ID = "team.rainfall.finality.loader";
     private static final String LOADER_VERSION = "2.0.0";
     private static final String DISTRIBUTION_VERSION = "1.6.2-diagnostic";
+    private static final int DEFAULT_D8_MIN_API = 21;
 
     private Main() { }
 
@@ -303,7 +304,6 @@ public final class Main {
 
     private static RunOptions parseArgs(String[] args) throws IOException {
         Map<String, String> options = new HashMap<String, String>();
-        List<String> d8Args = new ArrayList<String>();
         boolean buildForAndroid = false;
         for (int i = 0; i < args.length; i++) {
             String arg = args[i];
@@ -312,19 +312,14 @@ public final class Main {
             String key;
             if ("--core".equals(arg) || "-c".equals(arg)) key = "core";
             else if ("--mods".equals(arg) || "-m".equals(arg)) key = "mods";
-            else if ("--d8".equals(arg)) key = "d8";
-            else if ("--android-output".equals(arg)) key = "androidOutput";
-            else if ("--d8-arg".equals(arg)) {
-                if (++i >= args.length) throw new IOException("Missing value for " + arg);
-                d8Args.add(args[i]);
-                continue;
-            }
+            else if ("--d8-desugaring-lib".equals(arg)) key = "d8DesugaringLib";
+            else if ("--d8-min-api".equals(arg)) key = "d8MinApi";
             else if ("--".equals(arg)) { options.put("gameArgs", join(args, i + 1)); break; }
             else throw new IOException("Unknown option: " + arg);
             if (++i >= args.length) throw new IOException("Missing value for " + arg);
             options.put(key, args[i]);
         }
-        return new RunOptions(options, d8Args, buildForAndroid);
+        return new RunOptions(options, buildForAndroid);
     }
 
     private static Path requiredPath(Map<String, String> options, String key) throws IOException {
@@ -346,11 +341,11 @@ public final class Main {
 
     private static void buildForAndroid(Path corePath, Path listPath, List<Plugin> plugins,
                                         List<PluginMetadata> metadata, RunOptions options) throws Exception {
-        Path output = options.values.containsKey("androidOutput")
-                ? Paths.get(options.values.get("androidOutput")).toAbsolutePath().normalize()
-                : corePath.resolveSibling(corePath.getFileName().toString().replaceFirst("\\.jar$", "") + "-android");
-        Path d8 = options.values.containsKey("d8") ? Paths.get(options.values.get("d8")).toAbsolutePath().normalize() : findD8();
+        Path output = corePath.resolveSibling(corePath.getFileName().toString().replaceFirst("\\.jar$", "") + "-android");
+        Path d8 = findD8();
         if (!Files.isRegularFile(d8)) throw new IOException("d8 executable does not exist: " + d8);
+        int minApi = parseMinApi(options.values.get("d8MinApi"));
+        Path desugaringLib = resolveDesugaringLibrary(options.values.get("d8DesugaringLib"));
 
         Path merged = Files.createTempFile("finality-android-", ".jar");
         Path d8Output = Files.createTempDirectory("finality-d8-");
@@ -374,7 +369,12 @@ public final class Main {
 
             List<String> command = new ArrayList<String>();
             command.add(d8.toString());
-            command.addAll(options.d8Args);
+            command.add("--min-api");
+            command.add(Integer.toString(minApi));
+            if (desugaringLib != null) {
+                command.add("--lib");
+                command.add(desugaringLib.toString());
+            }
             command.add("--output");
             command.add(d8Output.toString());
             command.add(merged.toString());
@@ -383,15 +383,18 @@ public final class Main {
             int exitCode = process.waitFor();
             if (exitCode != 0) throw new IOException("d8 failed with exit code " + exitCode + ": " + new String(outputBytes, java.nio.charset.StandardCharsets.UTF_8));
             Files.createDirectories(output);
+            deleteDexFiles(output);
+            int dexCount = 0;
             try (java.util.stream.Stream<Path> files = Files.list(d8Output)) {
                 java.util.Iterator<Path> iterator = files.filter(path -> path.getFileName().toString().endsWith(".dex")).iterator();
                 while (iterator.hasNext()) {
                     Path dex = iterator.next();
                     Files.copy(dex, output.resolve(dex.getFileName()), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                    dexCount++;
                 }
             }
             if (!Files.isRegularFile(output.resolve("classes.dex"))) throw new IOException("d8 did not produce classes.dex");
-            FinalityLogger.info("Built Android dex output in " + output);
+            FinalityLogger.info("Built Android dex output (" + dexCount + " dex file(s)) in " + output);
         } finally {
             Files.deleteIfExists(merged);
             deleteTree(d8Output);
@@ -426,23 +429,107 @@ public final class Main {
         copy(input, output); return output.toByteArray();
     }
 
-    private static Path findD8() throws IOException {
+    private static Path androidHome() {
         String home = System.getenv("ANDROID_HOME");
         if (home == null || home.trim().isEmpty()) home = System.getenv("ANDROID_SDK_ROOT");
-        if (home == null || home.trim().isEmpty()) throw new IOException("No d8 configured; use --d8 or ANDROID_HOME");
-        Path buildTools = Paths.get(home, "build-tools");
-        try (java.util.stream.Stream<Path> versions = Files.list(buildTools)) {
-            List<Path> candidates = new ArrayList<Path>();
-            versions.filter(Files::isDirectory).forEach(candidates::add);
-            Collections.sort(candidates, (a, b) -> b.getFileName().toString().compareTo(a.getFileName().toString()));
-            for (Path version : candidates) {
-                Path unix = version.resolve("d8");
-                Path windows = version.resolve("d8.bat");
-                if (Files.isRegularFile(unix)) return unix;
-                if (Files.isRegularFile(windows)) return windows;
+        return home == null || home.trim().isEmpty() ? null : Paths.get(home);
+    }
+
+    private static Path findD8() throws IOException {
+        Path home = androidHome();
+        if (home == null) throw new IOException("No Android SDK configured; set ANDROID_HOME or ANDROID_SDK_ROOT");
+        Path buildTools = home.resolve("build-tools");
+        if (Files.isDirectory(buildTools)) {
+            try (java.util.stream.Stream<Path> versions = Files.list(buildTools)) {
+                List<Path> candidates = new ArrayList<Path>();
+                versions.filter(Files::isDirectory).forEach(candidates::add);
+                candidates.sort(NEWEST_VERSION_FIRST);
+                for (Path version : candidates) {
+                    Path unix = version.resolve("d8");
+                    Path windows = version.resolve("d8.bat");
+                    if (Files.isRegularFile(unix)) return unix;
+                    if (Files.isRegularFile(windows)) return windows;
+                }
             }
         }
         throw new IOException("No d8 executable found under " + buildTools);
+    }
+
+    private static int parseMinApi(String value) throws IOException {
+        if (value == null || value.trim().isEmpty()) return DEFAULT_D8_MIN_API;
+        try {
+            int minApi = Integer.parseInt(value.trim());
+            if (minApi <= 0) throw new NumberFormatException();
+            return minApi;
+        } catch (NumberFormatException e) {
+            throw new IOException("Invalid --d8-min-api value: " + value);
+        }
+    }
+
+    private static Path resolveDesugaringLibrary(String configured) throws IOException {
+        if (configured != null) {
+            Path path = Paths.get(configured).toAbsolutePath().normalize();
+            if (!Files.isRegularFile(path)) throw new IOException("Desugaring library does not exist: " + path);
+            return path;
+        }
+        return findDesugaringLibrary();
+    }
+
+    /** Locates the Android desugaring library (or the platform android.jar) from the SDK, if available. */
+    private static Path findDesugaringLibrary() {
+        Path home = androidHome();
+        if (home == null) return null;
+        Path stubs = findInNewestVersionDirectory(home.resolve("build-tools"), "core-lambda-stubs.jar");
+        if (stubs != null) return stubs;
+        return findInNewestVersionDirectory(home.resolve("platforms"), "android.jar");
+    }
+
+    private static Path findInNewestVersionDirectory(Path root, String fileName) {
+        if (!Files.isDirectory(root)) return null;
+        try (java.util.stream.Stream<Path> children = Files.list(root)) {
+            List<Path> candidates = new ArrayList<Path>();
+            children.filter(Files::isDirectory).forEach(candidates::add);
+            candidates.sort(NEWEST_VERSION_FIRST);
+            for (Path candidate : candidates) {
+                Path file = candidate.resolve(fileName);
+                if (Files.isRegularFile(file)) return file;
+            }
+        } catch (IOException ignored) { }
+        return null;
+    }
+
+    private static final java.util.Comparator<Path> NEWEST_VERSION_FIRST =
+            (left, right) -> compareVersionNames(right.getFileName().toString(), left.getFileName().toString());
+
+    private static int compareVersionNames(String left, String right) {
+        int i = 0, j = 0;
+        while (i < left.length() && j < right.length()) {
+            char leftChar = left.charAt(i);
+            char rightChar = right.charAt(j);
+            if (Character.isDigit(leftChar) && Character.isDigit(rightChar)) {
+                int leftEnd = i, rightEnd = j;
+                while (leftEnd < left.length() && Character.isDigit(left.charAt(leftEnd))) leftEnd++;
+                while (rightEnd < right.length() && Character.isDigit(right.charAt(rightEnd))) rightEnd++;
+                long leftValue = Long.parseLong(left.substring(i, leftEnd));
+                long rightValue = Long.parseLong(right.substring(j, rightEnd));
+                int result = Long.compare(leftValue, rightValue);
+                if (result != 0) return result;
+                i = leftEnd;
+                j = rightEnd;
+            } else {
+                if (leftChar != rightChar) return Character.compare(leftChar, rightChar);
+                i++;
+                j++;
+            }
+        }
+        return Integer.compare(left.length() - i, right.length() - j);
+    }
+
+    private static void deleteDexFiles(Path directory) throws IOException {
+        try (java.util.stream.Stream<Path> files = Files.list(directory)) {
+            java.util.Iterator<Path> iterator = files.filter(path -> path.getFileName().toString().endsWith(".dex")).iterator();
+            while (iterator.hasNext()) Files.deleteIfExists(iterator.next());
+        }
     }
 
     private static void deleteTree(Path directory) throws IOException {
@@ -455,16 +542,17 @@ public final class Main {
     }
 
     private static void usage() {
-        System.out.println("Usage: java -jar finality-loader.jar --core <game.jar> --mods <mod-list.json> [--build-for-android --d8 <d8> --android-output <directory> --d8-arg <arg> ...] [-- <game args...>]");
+        System.out.println("Usage: java -jar finality-loader.jar --core <game.jar> --mods <mod-list.json> [--build-for-android [--d8-desugaring-lib <jar>] [--d8-min-api <n>]] [-- <game args...>]");
         System.out.println("Mod list: [\"mods/example\"] or {\"mods\":[\"mods/example\"]}; each directory may contain plugins/*.jar.");
+        System.out.println("Android: d8, the desugaring library, and multidex output are managed automatically.");
+        System.out.println("Android output: <core>-android next to the game jar; default --d8-min-api is 21.");
     }
 
     private static final class RunOptions {
         final Map<String, String> values;
-        final List<String> d8Args;
         final boolean buildForAndroid;
-        RunOptions(Map<String, String> values, List<String> d8Args, boolean buildForAndroid) {
-            this.values = values; this.d8Args = d8Args; this.buildForAndroid = buildForAndroid;
+        RunOptions(Map<String, String> values, boolean buildForAndroid) {
+            this.values = values; this.buildForAndroid = buildForAndroid;
         }
     }
 
