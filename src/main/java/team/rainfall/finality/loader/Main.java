@@ -167,7 +167,8 @@ public final class Main {
             String name = requiredText(manifest, "name", file);
             String id = requiredText(manifest, "id", file);
             String version = requiredText(manifest, "version", file);
-            String description = requiredText(manifest, "description", file);
+            String description = optionalText(manifest, "description");
+            if (description == null) description = "";
             String mainClass = optionalText(manifest, "main-class");
             String strategy = optionalText(manifest, "strategy");
             if (strategy == null || strategy.trim().isEmpty()) strategy = "eject";

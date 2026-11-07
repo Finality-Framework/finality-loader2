@@ -115,6 +115,10 @@ public final class PatchTransformer {
         if (Boolean.getBoolean("finality.debug")) System.out.println("[DEBUG] " + message);
     }
 
+    private static void warn(String message) {
+        System.err.println("[WARN] " + message);
+    }
+
     private String commonSuperClass(String type1, String type2) throws IOException {
         if (type1.equals(type2)) return type1;
         ClassInfo first = classInfo(type1);
@@ -193,8 +197,11 @@ public final class PatchTransformer {
             boolean explicitlyOverwrite = hasAnnotation(source.visibleAnnotations, OVERWRITE);
             boolean specialInitializer = INIT.equals(source.name) || CLINIT.equals(source.name);
             if (specialInitializer && !explicitlyOverwrite) continue;
-            if (explicitlyOverwrite || old != null) {
-                if (old == null) throw new LumiPatchException("@Overwrite target method not found: " + source.name + source.desc);
+            if (old == null && explicitlyOverwrite) {
+                warn("@Overwrite target method not found, skipping: " + source.name + source.desc);
+                continue;
+            }
+            if (old != null) {
                 target.methods.remove(old);
                 additions.add(replacement);
                 methods.remove(source.name + source.desc);
@@ -246,6 +253,9 @@ public final class PatchTransformer {
         Type[] callbackArgs = Type.getArgumentTypes(source.desc);
         int expected = args.length + 1;
         if (callbackArgs.length != expected || !CALLBACK_INFO.equals(callbackArgs[callbackArgs.length - 1].getInternalName()) || Type.getReturnType(source.desc) != Type.VOID_TYPE) throw new LumiPatchException("Inject handler must accept target arguments and end with CallbackInfo: " + source.name + source.desc);
+        for (int i = 0; i < args.length; i++) {
+            if (!args[i].equals(callbackArgs[i])) throw new LumiPatchException("Inject handler parameter " + i + " does not match target method: expected " + args[i] + " but was " + callbackArgs[i] + " (" + source.name + source.desc + ")");
+        }
         InsnList result = new InsnList();
         int callbackSlot = localCount(destination);
         int localsSlot = callbackSlot + 1;
@@ -419,9 +429,15 @@ public final class PatchTransformer {
     private boolean matches(MethodInsnNode node, String target) {
         if (target == null || target.isEmpty()) return true;
         int open = target.indexOf('(');
-        String name = open < 0 ? target : target.substring(target.lastIndexOf('.', open) + 1, open);
-        String desc = open < 0 ? "" : target.substring(open);
-        return node.name.equals(name) && (desc.isEmpty() || node.desc.equals(desc));
+        if (open < 0) return node.name.equals(target);
+        String qualified = target.substring(0, open);
+        String desc = target.substring(open);
+        int dot = qualified.lastIndexOf('.');
+        String owner = dot < 0 ? "" : qualified.substring(0, dot);
+        String name = dot < 0 ? qualified : qualified.substring(dot + 1);
+        if (!node.name.equals(name)) return false;
+        if (!desc.isEmpty() && !node.desc.equals(desc)) return false;
+        return owner.isEmpty() || node.owner.equals(owner.replace('.', '/'));
     }
 
     private ClassNode read(byte[] bytes) { ClassNode node = new ClassNode(); new ClassReader(bytes).accept(node, 0); return node; }

@@ -214,6 +214,37 @@ class PatchTransformerTest {
         assertEquals("after", info.getLocal(0));
     }
 
+    @Test
+    void missingOverwriteTargetIsSkipped() throws Exception {
+        ClassNode node = read(new PatchTransformer().apply(bytes(Target.class), bytes(MissingOverwriteMixin.class)));
+        boolean added = false;
+        boolean missing = false;
+        for (MethodNode method : node.methods) {
+            if (method.name.equals("addedByMissingOverwriteMixin")) added = true;
+            if (method.name.equals("doesNotExist")) missing = true;
+        }
+        assertTrue(added);
+        assertTrue(!missing);
+    }
+
+    @Test
+    void injectAtTargetMatchesOwner() throws Exception {
+        byte[] transformed = new PatchTransformer().apply(bytes(InvokeTarget.class), bytes(OwnerInjectMixin.class));
+        assertTrue(transformed.length > 0);
+    }
+
+    @Test
+    void injectAtTargetWithWrongOwnerFails() {
+        org.junit.jupiter.api.Assertions.assertThrows(LumiPatchException.class,
+                () -> new PatchTransformer().apply(bytes(InvokeTarget.class), bytes(WrongOwnerInjectMixin.class)));
+    }
+
+    @Test
+    void injectHandlerParameterTypesMustMatchTarget() {
+        org.junit.jupiter.api.Assertions.assertThrows(LumiPatchException.class,
+                () -> new PatchTransformer().apply(bytes(InvokeTarget.class), bytes(BadParameterInjectMixin.class)));
+    }
+
     private static ClassNode read(byte[] bytes) {
         ClassNode node = new ClassNode();
         new ClassReader(bytes).accept(node, 0);
@@ -293,6 +324,35 @@ class PatchTransformerTest {
         boolean helperPresent = false;
         for (MethodNode method : node.methods) if (method.name.equals("helper") && method.desc.equals("()Ljava/lang/String;")) helperPresent = true;
         assertTrue(helperPresent);
+    }
+
+    @Mixin(target = "team.rainfall.lumipatch.PatchTransformerTest$Target")
+    public static class MissingOverwriteMixin {
+        @Overwrite
+        public String doesNotExist() { return "missing"; }
+        public String addedByMissingOverwriteMixin() { return "added"; }
+    }
+
+    public static class InvokeTarget {
+        public int measure(String value) { return value.length(); }
+    }
+
+    @Mixin(target = "team.rainfall.lumipatch.PatchTransformerTest$InvokeTarget")
+    public static class OwnerInjectMixin {
+        @Inject(method = "measure", at = @At(value = "BEFORE_INVOKE", target = "java.lang.String.length()I"))
+        public void before(String value, CallbackInfo info) { }
+    }
+
+    @Mixin(target = "team.rainfall.lumipatch.PatchTransformerTest$InvokeTarget")
+    public static class WrongOwnerInjectMixin {
+        @Inject(method = "measure", at = @At(value = "BEFORE_INVOKE", target = "java.lang.StringBuilder.length()I"))
+        public void before(String value, CallbackInfo info) { }
+    }
+
+    @Mixin(target = "team.rainfall.lumipatch.PatchTransformerTest$InvokeTarget")
+    public static class BadParameterInjectMixin {
+        @Inject(method = "measure", at = @At("HEAD"))
+        public void before(int wrongType, CallbackInfo info) { }
     }
 
     @Mixin(target = "team.rainfall.lumipatch.PatchTransformerTest$Target", autoRename = true)
